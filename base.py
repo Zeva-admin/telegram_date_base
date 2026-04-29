@@ -491,6 +491,140 @@ def now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _safe_zip_name(value: str) -> str:
+    safe = re.sub(r"[^\w\-.]+", "_", (value or "").strip())
+    return safe or "item"
+
+
+def _unique_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    stem = path.stem
+    suffix = path.suffix
+    parent = path.parent
+    for i in range(2, 10_000):
+        candidate = parent / f"{stem}_{i}{suffix}"
+        if not candidate.exists():
+            return candidate
+    return parent / f"{stem}_{datetime.now().strftime('%H%M%S')}{suffix}"
+
+
+def _record_meta_text(db_name: str, record: dict) -> str:
+    meta = record.get("metadata", {}) or {}
+    lines = [
+        f"db: {db_name}",
+        f"id: {record.get('id')}",
+        f"type: {record.get('type')}",
+        f"timestamp: {record.get('timestamp')}",
+    ]
+    text_value = (record.get("text") or "").strip()
+    if text_value:
+        lines.append("")
+        lines.append("text:")
+        lines.append(text_value)
+    if meta:
+        lines.append("")
+        lines.append("metadata:")
+        try:
+            lines.append(json.dumps(meta, ensure_ascii=False, indent=2))
+        except Exception:
+            lines.append(str(meta))
+    return "\n".join(lines).strip() + "\n"
+
+
+def _guess_extension(record: dict, tg_file_path: Optional[str]) -> str:
+    meta = record.get("metadata", {}) or {}
+    name = meta.get("file_name")
+    if isinstance(name, str) and "." in name:
+        ext = Path(name).suffix
+        if ext:
+            return ext
+    if tg_file_path:
+        ext = Path(str(tg_file_path)).suffix
+        if ext:
+            return ext
+    rtype = (record.get("type") or "").lower()
+    return {
+        "photo": ".jpg",
+        "video": ".mp4",
+        "video_note": ".mp4",
+        "voice": ".ogg",
+        "audio": ".mp3",
+        "document": ".bin",
+        "sticker": ".webp",
+    }.get(rtype, ".bin")
+
+
+async def _build_bases_files_zip(bot: Bot) -> Path:
+    """
+    Собирает ZIP со всем содержимым баз:
+    - для текстовых записей создаёт .txt
+    - для медиа/файлов скачивает реальные файлы из Telegram
+    - для каждой записи добавляет companion meta .txt
+    """
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    zip_tmp = Path(tempfile.gettempdir()) / f"bases_content_{timestamp}.zip"
+
+    all_items = load_all_dbs_records()
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "base"
+        root.mkdir(parents=True, exist_ok=True)
+
+        errors: list[str] = []
+        for item in all_items:
+            raw_db_name = str(item.get("db_name", "") or "")
+            db_dir = root / _safe_zip_name(raw_db_name)
+            db_dir.mkdir(parents=True, exist_ok=True)
+
+            record = item.get("record") or {}
+            rid = record.get("id")
+            rtype = str(record.get("type", "unknown") or "unknown")
+            rid_str = str(rid) if rid is not None else "noid"
+
+            base_name = f"record_{rid_str}_{_safe_zip_name(rtype)}"
+
+            # Meta info (always)
+            meta_path = _unique_path(db_dir / f"{base_name}_meta.txt")
+            try:
+                meta_path.write_text(_record_meta_text(raw_db_name, record), encoding="utf-8")
+            except OSError as e:
+                errors.append(f"{raw_db_name}:#{rid_str} meta write failed: {e}")
+
+            # Text-only record
+            if rtype == "text":
+                text_path = _unique_path(db_dir / f"{base_name}.txt")
+                try:
+                    text_value = (record.get("text") or "").rstrip() + "\n"
+                    text_path.write_text(text_value, encoding="utf-8")
+                except OSError as e:
+                    errors.append(f"{raw_db_name}:#{rid_str} text write failed: {e}")
+                continue
+
+            file_id = record.get("file_id")
+            if not file_id:
+                continue
+
+            try:
+                tg_file = await bot.get_file(str(file_id))
+                tg_path = getattr(tg_file, "file_path", None)
+                ext = _guess_extension(record, tg_path)
+                file_path = _unique_path(db_dir / f"{base_name}{ext}")
+                await bot.download_file(tg_path, destination=str(file_path))
+            except Exception as e:
+                errors.append(f"{raw_db_name}:#{rid_str} download failed: {e}")
+
+        if errors:
+            (root / "_errors.txt").write_text("\n".join(errors) + "\n", encoding="utf-8")
+
+        with zipfile.ZipFile(zip_tmp, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for file in sorted(root.rglob("*")):
+                if file.is_file():
+                    zf.write(file, arcname=str(file.relative_to(Path(td))))
+
+    return zip_tmp
+
+
 def db_exists(db_name: str) -> bool:
     """Проверяет существование базы данных."""
     key = normalize_db_key(db_name)
@@ -1644,9 +1778,9 @@ async def cmd_help(message: Message) -> None:
         "✏️ <b>Изменить запись</b> — редактировать текст\n"
         "📊 <b>Статистика</b> — информация о базе\n"
         "📁 <b>Список баз</b> — все базы данных\n\n"
-        f"{BACKUP_ALL_BUTTON_TEXT} — скачать ZIP со всеми базами\n\n"
-        "💡 Базы хранятся в папке <code>base/</code> в формате JSON.\n"
-        "Все файлы сохраняются по Telegram file_id без потери качества."
+        f"{BACKUP_ALL_BUTTON_TEXT} — скачать ZIP со всем содержимым баз\n\n"
+        "💡 Базы хранятся локально (base/) или в Supabase.\n"
+        "Файлы выгружаются из Telegram по file_id без потери качества."
     )
     await message.answer(text, reply_markup=main_menu_keyboard())
 
@@ -2912,14 +3046,14 @@ async def backup_all_bases(message: Message, state: FSMContext) -> None:
         return
 
     await state.clear()
-    await message.answer("📦 Собираю архив со всеми базами…")
+    await message.answer("📦 Собираю архив со всеми файлами из баз…")
 
     zip_path: Optional[Path] = None
     try:
-        zip_path = await asyncio.to_thread(_build_bases_zip)
+        zip_path = await _build_bases_files_zip(bot)
         await message.answer_document(
             FSInputFile(str(zip_path)),
-            caption="📦 Архив баз данных (backup)",
+            caption="📦 Архив содержимого баз (backup)",
         )
     finally:
         if zip_path:
