@@ -10,6 +10,7 @@ Telegram Bot - Умная база данных контента
 
 import asyncio
 import html
+import hashlib
 import json
 import logging
 import os
@@ -26,6 +27,7 @@ from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
 
 import psycopg2
 import psycopg2.extras
+from psycopg2.extensions import connection as PGConnection
 
 try:
     from groq import Groq
@@ -185,6 +187,56 @@ def _supabase_healthcheck() -> bool:
     except Exception as e:
         logger.error(f"Supabase healthcheck failed: {e}")
         return False
+
+
+BOT_LOCK_CONN: Optional[PGConnection] = None
+
+
+def _bot_lock_key() -> int:
+    """
+    Telegram polling допускает только одного poller-а на BOT_TOKEN.
+    Для Render (rolling deploy / scaled instances) берём распределённый lock в Postgres.
+    """
+    raw = (BOT_TOKEN or "").encode("utf-8")
+    digest = hashlib.sha256(raw).digest()
+    key_u64 = int.from_bytes(digest[:8], "big", signed=False)
+    # pg_advisory_lock принимает signed bigint
+    return key_u64 - (1 << 64) if key_u64 >= (1 << 63) else key_u64
+
+
+def _acquire_bot_lock_blocking() -> bool:
+    global BOT_LOCK_CONN
+    if not USE_SUPABASE:
+        return True
+    if BOT_LOCK_CONN is not None:
+        return True
+
+    try:
+        conn = _pg_connect()
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_try_advisory_lock(%s);", (_bot_lock_key(),))
+            ok = bool(cur.fetchone()[0])
+        if ok:
+            BOT_LOCK_CONN = conn
+            return True
+        conn.close()
+        return False
+    except Exception as e:
+        logger.error(f"Не удалось получить bot lock (Supabase): {e}")
+        return True  # не блокируем запуск, если lock-схема недоступна
+
+
+def _release_bot_lock_blocking() -> None:
+    global BOT_LOCK_CONN
+    conn = BOT_LOCK_CONN
+    BOT_LOCK_CONN = None
+    if not conn:
+        return
+    try:
+        conn.close()
+    except Exception:
+        pass
 
 # Настройка логирования
 logging.basicConfig(
@@ -3164,6 +3216,10 @@ async def on_shutdown() -> None:
         await bot.delete_webhook()
     except Exception:
         pass
+    try:
+        await asyncio.to_thread(_release_bot_lock_blocking)
+    except Exception:
+        pass
     await bot.session.close()
 
 
@@ -3184,6 +3240,14 @@ async def main() -> None:
 
     try:
         logger.info("Запуск поллинга...")
+        # Render может держать 2 инстанса во время деплоя или при scaling.
+        # Чтобы не ловить TelegramConflictError, берём advisory-lock в Postgres (если включён Supabase).
+        while True:
+            ok = await asyncio.to_thread(_acquire_bot_lock_blocking)
+            if ok:
+                break
+            logger.warning("Другой инстанс уже запущен (bot lock). Жду освобождения…")
+            await asyncio.sleep(5)
         await dp.start_polling(
             bot,
             allowed_updates=dp.resolve_used_update_types(),
