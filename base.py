@@ -2970,6 +2970,44 @@ async def unknown_message(message: Message, state: FSMContext) -> None:
 # ЗАПУСК БОТА
 # ─────────────────────────────────────────────────────────
 
+async def _render_http_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    """
+    Минимальный HTTP-ответ, чтобы Render (Web Service) видел открытый порт.
+    Боту webhook не нужен — это только "keep-alive" endpoint.
+    """
+    try:
+        try:
+            await reader.read(1024)
+        except Exception:
+            pass
+
+        body = b"OK"
+        headers = (
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: text/plain; charset=utf-8\r\n"
+            + f"Content-Length: {len(body)}\r\n".encode("ascii")
+            + b"Connection: close\r\n"
+            + b"\r\n"
+        )
+        writer.write(headers + body)
+        await writer.drain()
+    finally:
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+
+async def start_render_server() -> asyncio.AbstractServer:
+    port_s = os.environ.get("PORT", str(WEBAPP_PORT))
+    try:
+        port = int(port_s)
+    except ValueError:
+        port = WEBAPP_PORT
+    return await asyncio.start_server(_render_http_handler, host=WEBAPP_HOST, port=port)
+
+
 async def on_startup() -> None:
     """Действия при запуске бота."""
     BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -2978,17 +3016,8 @@ async def on_startup() -> None:
         ok = _supabase_healthcheck()
         logger.info(f"Supabase: {'OK' if ok else 'DOWN'} | table={SUPABASE_TABLE}")
 
-    if WEBHOOK_URL:
-        webhook_full_url = f"{WEBHOOK_URL.rstrip('/')}{WEBHOOK_PATH}"
-        await bot.set_webhook(
-            url=webhook_full_url,
-            secret_token=WEBHOOK_SECRET_TOKEN or None,
-            drop_pending_updates=True,
-        )
-        logger.info(f"Webhook установлен: {webhook_full_url}")
-    else:
-        # На всякий случай убираем webhook, если запускаемся в polling-режиме.
-        await bot.delete_webhook(drop_pending_updates=True)
+    # Работаем только через polling — на всякий случай убираем webhook.
+    await bot.delete_webhook(drop_pending_updates=True)
     bot_info = await bot.get_me()
     logger.info(f"Бот запущен: @{bot_info.username} (ID: {bot_info.id})")
     logger.info(f"Папка для баз данных: {BASE_DIR.resolve()}")
@@ -2997,11 +3026,10 @@ async def on_startup() -> None:
 async def on_shutdown() -> None:
     """Действия при остановке бота."""
     logger.info("Бот остановлен.")
-    if WEBHOOK_URL:
-        try:
-            await bot.delete_webhook()
-        except Exception:
-            pass
+    try:
+        await bot.delete_webhook()
+    except Exception:
+        pass
     await bot.session.close()
 
 
@@ -3011,30 +3039,25 @@ async def main() -> None:
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
 
-    if WEBHOOK_URL:
-        app = web.Application()
-        SimpleRequestHandler(
-            dispatcher=dp,
-            bot=bot,
-            secret_token=WEBHOOK_SECRET_TOKEN or None,
-        ).register(app, path=WEBHOOK_PATH)
-        setup_application(app, dp, bot=bot)
+    server = await start_render_server()
+    sockets = server.sockets or []
+    if sockets:
+        try:
+            port = sockets[0].getsockname()[1]
+            logger.info(f"HTTP server listening on {WEBAPP_HOST}:{port}")
+        except Exception:
+            logger.info("HTTP server listening")
 
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.TCPSite(runner, host=WEBAPP_HOST, port=WEBAPP_PORT)
-        await site.start()
-        logger.info(f"Webhook server listening on {WEBAPP_HOST}:{WEBAPP_PORT}{WEBHOOK_PATH}")
-
-        # Ждём бесконечно (aiohttp будет обрабатывать запросы)
-        await asyncio.Event().wait()
-    else:
+    try:
         logger.info("Запуск поллинга...")
         await dp.start_polling(
             bot,
             allowed_updates=dp.resolve_used_update_types(),
             drop_pending_updates=True,  # Игнорируем накопившиеся обновления при старте
         )
+    finally:
+        server.close()
+        await server.wait_closed()
 
 
 if __name__ == "__main__":
