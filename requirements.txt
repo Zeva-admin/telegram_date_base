@@ -1,0 +1,4 @@
+aiogram==3.20.0.post0
+aiohttp==3.11.18
+psycopg2-binary==2.9.10
+groq==0.22.0
