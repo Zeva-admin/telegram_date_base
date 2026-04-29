@@ -47,6 +47,10 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     FSInputFile,
+    InputMediaAudio,
+    InputMediaDocument,
+    InputMediaPhoto,
+    InputMediaVideo,
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
@@ -607,15 +611,62 @@ def _guess_extension(record: dict, tg_file_path: Optional[str]) -> str:
     }.get(rtype, ".bin")
 
 
-async def _build_bases_files_zip(bot: Bot) -> Path:
+def _zip_root_to_parts(root: Path, zip_prefix: str, *, max_part_bytes: int) -> list[Path]:
+    files = [p for p in sorted(root.rglob("*")) if p.is_file()]
+    if not files:
+        zip_path = Path(tempfile.gettempdir()) / f"{zip_prefix}.zip"
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            pass
+        return [zip_path]
+
+    parts: list[Path] = []
+    part_index = 1
+    current_path = Path(tempfile.gettempdir()) / f"{zip_prefix}_part{part_index}.zip"
+    zf = zipfile.ZipFile(current_path, "w", compression=zipfile.ZIP_DEFLATED)
+    current_est = 0
+
+    def _new_part() -> None:
+        nonlocal part_index, current_path, zf, current_est
+        zf.close()
+        parts.append(current_path)
+        part_index += 1
+        current_path = Path(tempfile.gettempdir()) / f"{zip_prefix}_part{part_index}.zip"
+        zf = zipfile.ZipFile(current_path, "w", compression=zipfile.ZIP_DEFLATED)
+        current_est = 0
+
+    try:
+        for file in files:
+            try:
+                size = int(file.stat().st_size)
+            except OSError:
+                size = 0
+            # ZIP overhead approximation (+2KB per file) to avoid overshooting limit.
+            est = size + 2048
+            if current_est and (current_est + est) > max_part_bytes:
+                _new_part()
+
+            arcname = str(file.relative_to(root.parent))
+            zf.write(file, arcname=arcname)
+            current_est += est
+    finally:
+        try:
+            zf.close()
+        except Exception:
+            pass
+
+    parts.append(current_path)
+    return parts
+
+
+async def _build_bases_files_zips(bot: Bot, *, max_part_bytes: int = 45 * 1024 * 1024) -> list[Path]:
     """
-    Собирает ZIP со всем содержимым баз:
+    Собирает ZIP-архив(ы) со всем содержимым баз:
     - для текстовых записей создаёт .txt
     - для медиа/файлов скачивает реальные файлы из Telegram
     - для каждой записи добавляет companion meta .txt
     """
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    zip_tmp = Path(tempfile.gettempdir()) / f"bases_content_{timestamp}.zip"
+    zip_prefix = f"bases_content_{timestamp}"
 
     all_items = load_all_dbs_records()
 
@@ -662,19 +713,14 @@ async def _build_bases_files_zip(bot: Bot) -> Path:
                 tg_path = getattr(tg_file, "file_path", None)
                 ext = _guess_extension(record, tg_path)
                 file_path = _unique_path(db_dir / f"{base_name}{ext}")
-                await bot.download_file(tg_path, destination=str(file_path))
+                await bot.download_file(tg_path, destination=str(file_path), timeout=120)
             except Exception as e:
                 errors.append(f"{raw_db_name}:#{rid_str} download failed: {e}")
 
         if errors:
             (root / "_errors.txt").write_text("\n".join(errors) + "\n", encoding="utf-8")
 
-        with zipfile.ZipFile(zip_tmp, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            for file in sorted(root.rglob("*")):
-                if file.is_file():
-                    zf.write(file, arcname=str(file.relative_to(Path(td))))
-
-    return zip_tmp
+        return _zip_root_to_parts(root, zip_prefix, max_part_bytes=max_part_bytes)
 
 
 def db_exists(db_name: str) -> bool:
@@ -1063,6 +1109,7 @@ async def ai_assistant_decide(query: str, *, databases: list[dict]) -> dict:
     - {"action":"answer","text":"..."}
     - {"action":"search","query":"..."}
     - {"action":"send_db","db":"<db_name>"}
+    - {"action":"send_files","db":"<db_name>","ids":[1,2,3]}  (ids опционально; если пусто/нет — отправить все файлы базы)
     - {"action":"send_source","file":"base.py|bot.py"}
     - {"action":"delete_db","db":"<db_name>"}
     """
@@ -1090,11 +1137,13 @@ async def ai_assistant_decide(query: str, *, databases: list[dict]) -> dict:
         "Правила:\n"
         "- Если пользователь хочет найти что-то в базе (где/найди/поиск/в каком отсеке) -> action=search.\n"
         "- Если просит скинуть файл базы -> action=send_db.\n"
+        "- Если просит скинуть файлы из базы (все или по id) -> action=send_files.\n"
         "- Если просит удалить базу целиком -> action=delete_db.\n"
         "- Если просит скинуть код -> action=send_source (только base.py или bot.py).\n"
         "- Иначе -> action=answer.\n\n"
         "Дополнительно:\n"
         "- В поле db используй ТОЛЬКО значение из списка db.\n"
+        "- Если пользователь просит конкретные записи, заполни ids числами.\n"
         "- Если не уверен с db, выбери action=search.\n\n"
         "Верни JSON одной строкой."
     )
@@ -1135,6 +1184,39 @@ def _guess_db_name_from_text(text: str, databases: list[dict]) -> str:
             if name.lower() == token.lower():
                 return name
     return ""
+
+
+def _quick_ask_intent(query: str, databases: list[dict]) -> Optional[dict]:
+    """
+    Быстрые команды без обращения к модели.
+    Поддержка:
+    - "скинь все файлы из базы X"
+    - "скинь файлы из базы X id 1 2 3"
+    """
+    q = (query or "").strip()
+    if not q:
+        return None
+    ql = q.lower()
+    db = _guess_db_name_from_text(q, databases)
+    if not db:
+        return None
+
+    wants_files = bool(re.search(r"\b(файл|файлы|медиа|документ|документы|фото|видео|аудио|голос)\b", ql))
+    if not wants_files:
+        return None
+
+    ids: list[int] = []
+    # Явные указатели id/#/запись
+    if re.search(r"\b(id|#|запис[ьи])\b", ql):
+        ids = [int(x) for x in re.findall(r"\b\d+\b", ql)][:50]
+
+    if re.search(r"\b(все|всё)\b", ql) and wants_files:
+        return {"action": "send_files", "db": db, "ids": []}
+
+    if ids:
+        return {"action": "send_files", "db": db, "ids": ids}
+
+    return None
 
 
 async def semantic_search_records_ai(db_name: str, query: str, *, limit: int = 10) -> list[dict]:
@@ -1604,6 +1686,7 @@ def browse_list_keyboard(page_records: list[dict], current_page: int, total_page
         rtype = record.get("type", "unknown")
         label = f"#{rid} · {rtype}"
         rows.append([InlineKeyboardButton(text=label, callback_data=f"browse_open_{rid}")])
+    rows.append([InlineKeyboardButton(text="📤 Открыть все", callback_data="browse_sendall")])
     rows.append(browse_keyboard(current_page, total_pages, db_name="").inline_keyboard[0])
     rows.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="go_home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -1671,6 +1754,82 @@ def format_file_size(size_bytes: int) -> str:
             return f"{size_bytes:.1f} {unit}"
         size_bytes /= 1024
     return f"{size_bytes:.1f} ТБ"
+
+
+def _record_caption_for_send(record: dict) -> Optional[str]:
+    trusted_html = bool(record.get("_trusted_html"))
+    text_value = (record.get("text") or "").strip()
+    if not text_value:
+        return None
+    safe_text = text_value if trusted_html else html.escape(text_value)
+    return safe_text[:1024] if safe_text else None
+
+
+async def _flush_media_group(target: Message, media_group: list) -> None:
+    if not media_group:
+        return
+    try:
+        await target.answer_media_group(media_group)
+    except Exception as e:
+        logger.error(f"Ошибка отправки media group: {e}")
+        # fallback: отправим по одному
+        for media in media_group:
+            try:
+                if isinstance(media, InputMediaPhoto):
+                    await target.answer_photo(photo=media.media, caption=media.caption)
+                elif isinstance(media, InputMediaVideo):
+                    await target.answer_video(video=media.media, caption=media.caption)
+                elif isinstance(media, InputMediaDocument):
+                    await target.answer_document(document=media.media, caption=media.caption)
+                elif isinstance(media, InputMediaAudio):
+                    await target.answer_audio(audio=media.media, caption=media.caption)
+            except Exception:
+                continue
+
+
+async def send_all_files_from_db(target: Message, db_name: str, *, limit: int = 600) -> None:
+    db = load_db(db_name)
+    records = db.get("records", []) or []
+    file_records = [r for r in records if r.get("type") != "text" and r.get("file_id")]
+    total = len(file_records)
+    if total == 0:
+        await target.answer("📭 В этой базе нет файлов.")
+        return
+
+    if total > limit:
+        await target.answer(f"⚠️ В базе <b>{total}</b> файлов. Отправлю первые <b>{limit}</b>.")
+        file_records = file_records[:limit]
+    else:
+        await target.answer(f"📤 Отправляю все файлы из базы <code>{html.escape(str(db_name))}</code> (всего: <b>{total}</b>)…")
+
+    media_group: list = []
+    sent = 0
+    for record in file_records:
+        rtype = (record.get("type") or "unknown").lower()
+        file_id = record.get("file_id")
+        if not file_id:
+            continue
+
+        caption = _record_caption_for_send(record)
+
+        if rtype == "photo":
+            media_group.append(InputMediaPhoto(media=str(file_id), caption=caption))
+        elif rtype == "video":
+            media_group.append(InputMediaVideo(media=str(file_id), caption=caption))
+        else:
+            await _flush_media_group(target, media_group)
+            media_group = []
+            await send_record_content(target, record)
+            sent += 1
+            continue
+
+        if len(media_group) >= 10:
+            await _flush_media_group(target, media_group)
+            sent += len(media_group)
+            media_group = []
+            await asyncio.sleep(0.2)
+
+    await _flush_media_group(target, media_group)
 
 
 async def send_record_content(
@@ -2043,15 +2202,16 @@ async def _run_ask_assistant(message: Message, state: FSMContext, query: str) ->
         return
 
     databases = get_all_databases()
-    decision = {}
-    try:
-        decision = await ai_assistant_decide(query, databases=databases)
-    except Exception as e:
-        logger.error(f"/ask: ошибка AI decide: {e}")
-        decision = {"action": "search", "query": query}
+    guessed_db = _guess_db_name_from_text(query, databases)
+    decision = _quick_ask_intent(query, databases) or {}
+    if not decision:
+        try:
+            decision = await ai_assistant_decide(query, databases=databases)
+        except Exception as e:
+            logger.error(f"/ask: ошибка AI decide: {e}")
+            decision = {"action": "search", "query": query}
 
     action = (decision.get("action") or "answer").lower()
-    guessed_db = _guess_db_name_from_text(query, databases)
 
     # 1) Поиск по базам
     if action == "search":
@@ -2077,6 +2237,37 @@ async def _run_ask_assistant(message: Message, state: FSMContext, query: str) ->
             await message.answer(text)
             if record.get("type") != "text" and record.get("file_id"):
                 await send_record_content(message, record)
+        return
+
+    # 2) Скинуть файлы из базы (все или по id)
+    if action == "send_files":
+        db_name = (decision.get("db") or guessed_db or "").strip()
+        if not db_name:
+            await message.answer("⚠️ Укажите имя базы (например: <code>Test_number_1</code>).")
+            return
+        if not db_exists(db_name):
+            await message.answer(f"❌ База <code>{db_name}</code> не найдена.")
+            return
+
+        raw_ids = decision.get("ids")
+        ids: list[int] = []
+        if isinstance(raw_ids, list):
+            for x in raw_ids:
+                try:
+                    ids.append(int(x))
+                except Exception:
+                    continue
+        if ids:
+            for rid in ids[:50]:
+                record = get_record_by_id(db_name, rid)
+                if not record:
+                    await message.answer(f"⚠️ Запись <b>#{rid}</b> не найдена в <code>{db_name}</code>.")
+                    continue
+                await send_record_content(message, record)
+                await asyncio.sleep(0.2)
+            return
+
+        await send_all_files_from_db(message, db_name, limit=SAY_MAX_ITEMS)
         return
 
     # 2) Скинуть файл базы
@@ -2465,6 +2656,18 @@ async def browse_send_record(callback: CallbackQuery, state: FSMContext) -> None
 
     await send_record_content(callback, record)
     await callback.answer("✅ Отправлено", show_alert=False)
+
+
+@router.callback_query(F.data == "browse_sendall", StateFilter(OpenBase.browsing))
+async def browse_send_all_records(callback: CallbackQuery, state: FSMContext) -> None:
+    """Отправить все файлы из текущей базы."""
+    data = await state.get_data()
+    db_name = data.get("db_name", "")
+    if not db_name:
+        await callback.answer("⚠️ База не выбрана", show_alert=False)
+        return
+    await callback.answer("📤 Отправляю…", show_alert=False)
+    await send_all_files_from_db(callback.message, db_name, limit=SAY_MAX_ITEMS)
 
 
 @router.message(StateFilter(OpenBase.waiting_db_name))
@@ -3100,17 +3303,32 @@ async def backup_all_bases(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer("📦 Собираю архив со всеми файлами из баз…")
 
-    zip_path: Optional[Path] = None
+    zip_paths: list[Path] = []
     try:
-        zip_path = await _build_bases_files_zip(bot)
-        await message.answer_document(
-            FSInputFile(str(zip_path)),
-            caption="📦 Архив содержимого баз (backup)",
-        )
-    finally:
-        if zip_path:
+        zip_paths = await _build_bases_files_zips(bot)
+        if not zip_paths:
+            await message.answer("❌ Не удалось собрать архив.")
+            return
+        for i, zp in enumerate(zip_paths, 1):
             try:
-                zip_path.unlink(missing_ok=True)
+                size = zp.stat().st_size
+            except OSError:
+                size = 0
+            try:
+                await message.answer_document(
+                    FSInputFile(str(zp)),
+                    caption=f"📦 Архив содержимого баз (часть {i}/{len(zip_paths)}) · {format_file_size(int(size))}",
+                    request_timeout=600,
+                )
+            except Exception as e:
+                logger.error(f"backup: send zip part failed: {e}")
+                await message.answer(f"❌ Не удалось отправить часть {i}/{len(zip_paths)}: <code>{html.escape(str(e))}</code>")
+                break
+            await asyncio.sleep(0.5)
+    finally:
+        for zp in zip_paths:
+            try:
+                zp.unlink(missing_ok=True)
             except OSError:
                 pass
 
